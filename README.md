@@ -15,6 +15,23 @@ A lightweight, secure, encrypted remote command server and client written in Pyt
 
 ## Quick Start (Direct Mode)
 
+### Automated Installation (Windows Server)
+
+For the easiest setup on a Windows machine, run the installer as Administrator:
+```cmd
+install.bat
+```
+This will automatically:
+1. Install Python dependencies
+2. Generate TLS certificates (`server.crt`, `server.key`)
+3. Prompt you to set a secure password
+4. Install and start the server as a background Windows Service
+5. Launch the watermark indicator
+
+To cleanly uninstall everything later, run `uninstall.bat` as Administrator.
+
+### Manual Setup (Cross-Platform / Debug)
+
 1. Generate TLS certificates:
    ```cmd
    python gen_certs.py
@@ -23,13 +40,17 @@ A lightweight, secure, encrypted remote command server and client written in Pyt
    ```cmd
    python setup_password.py
    ```
-3. Start the server:
+3. Start the server (runs in foreground):
    ```cmd
    python server.py run
    ```
-4. Connect the client:
+4. Connect the client (from any machine):
    ```cmd
    python client.py --host 127.0.0.1 --cert server.crt
+   ```
+5. Test the connection:
+   ```cmd
+   python test.py
    ```
 
 ## Setting up Relay Mode on Google Cloud Platform (GCP)
