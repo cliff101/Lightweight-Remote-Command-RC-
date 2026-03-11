@@ -46,6 +46,20 @@ import threading
 import time
 import uuid
 
+# --- Auto-inject user's roaming site-packages for Windows Service mode ---
+# When running as LocalSystem, the user-level site-packages are not in sys.path.
+# If Python is installed in the user profile, we try to add their Roaming packages.
+try:
+    _exe_path = sys.executable
+    if "AppData" in _exe_path:
+        _user_profile = _exe_path.split("AppData")[0].rstrip("\\/")
+        _py_ver = f"Python{sys.version_info.major}{sys.version_info.minor}"
+        _roaming_site = os.path.join(_user_profile, "AppData", "Roaming", "Python", _py_ver, "site-packages")
+        if os.path.isdir(_roaming_site) and _roaming_site not in sys.path:
+            sys.path.append(_roaming_site)
+except Exception:
+    pass
+
 # Set by SvcStop or KeyboardInterrupt – all loops check this to know when to quit.
 _stop_flag = threading.Event()
 
@@ -173,8 +187,93 @@ def _recv_exactly(conn, n: int):
 # ---------------------------------------------------------------------------
 _SYS_ENC = locale.getpreferredencoding(False) or "cp850"
 
-def _run_shell(conn: ssl.SSLSocket, ip: str, logger: logging.Logger):
+def _run_shell(conn: ssl.SSLSocket, ip: str, logger: logging.Logger, use_pty: bool = False):
     """Spawns a cmd.exe process and blindly streams IO back and forth."""
+    
+    # Try to use ConPTY (pywinpty) if available to support interactive features like Tab completion.
+    pty_available = False
+    try:
+        import winpty
+        pty_available = True
+    except ImportError:
+        pass
+
+    if use_pty and pty_available:
+        try:
+            import winpty
+            pty = winpty.PTY(120, 30)
+            pty.spawn(r"C:\Windows\System32\cmd.exe")
+
+            # Initialization sequence for PTY: change directory and clear screen
+            pty.write("cd /d C:\\\r\ncls\r\n")
+
+            def output_relay():
+                try:
+                    while True:
+                        chunk = pty.read(blocking=True)
+                        if not chunk:
+                            break
+                        _send(conn, {"type": "output_chunk", "data": chunk})
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        _send(conn, {"type": "command_done", "returncode": -1, "cwd": ""})
+                    except Exception:
+                        pass
+
+            t = threading.Thread(target=output_relay, daemon=True, name=f"shell-output-{ip}")
+            t.start()
+
+            try:
+                while True:
+                    msg = _recv(conn)
+                    if msg is None:
+                        logger.info(f"Connection closed by {ip}")
+                        break
+
+                    mtype = msg.get("type")
+
+                    if mtype == "quit":
+                        try:
+                            _send(conn, {"type": "bye"})
+                        except Exception:
+                            pass
+                        break
+
+                    elif mtype in ("command", "input"):
+                        data = msg.get("cmd", "") if mtype == "command" else msg.get("data", "")
+                        if mtype == "command" and not data.endswith("\n"):
+                            data += "\n"
+                        
+                        if data:
+                            # Normalize line endings to \r\n for ConPTY
+                            data = data.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+                            try:
+                                pty.write(data)
+                            except Exception:
+                                break
+                    else:
+                        try:
+                            _send(conn, {"type": "error", "message": f"Unknown message type: {mtype!r}"})
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.warning(f"Connection error from {ip} in PTY mode: {e}")
+            finally:
+                try:
+                    # Closing the conn forces the relay handler to terminate if it hasn't already
+                    conn.close()
+                except Exception:
+                    pass
+                try:
+                    del pty
+                except Exception:
+                    pass
+            return
+        except Exception as e:
+            logger.warning(f"ConPTY failed to start: {e}. Falling back to standard pipes.")
+
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     
     # Pass the current environment variables so PATH is preserved
@@ -261,7 +360,10 @@ def _run_shell(conn: ssl.SSLSocket, ip: str, logger: logging.Logger):
             mtype = msg.get("type")
 
             if mtype == "quit":
-                _send(conn, {"type": "bye"})
+                try:
+                    _send(conn, {"type": "bye"})
+                except Exception:
+                    pass
                 break
 
             elif mtype in ("command", "input"):
@@ -271,15 +373,24 @@ def _run_shell(conn: ssl.SSLSocket, ip: str, logger: logging.Logger):
                 
                 # Normalize line endings to \r\n for Windows apps
                 if data:
-                    data = data.replace("\r\n", "\n").replace("\n", "\r\n")
+                    data = data.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
                     try:
                         proc.stdin.write(data.encode(_SYS_ENC, errors="replace"))
                         proc.stdin.flush()
                     except Exception:
                         break
             else:
-                _send(conn, {"type": "error", "message": f"Unknown message type: {mtype!r}"})
+                try:
+                    _send(conn, {"type": "error", "message": f"Unknown message type: {mtype!r}"})
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.warning(f"Connection error from {ip} in legacy shell mode: {e}")
     finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
         try:
             proc.kill()
         except Exception:
@@ -330,12 +441,22 @@ def _handle_client(conn: ssl.SSLSocket, addr: tuple,
             _write_stats()
             security.record_success(ip)
             logger.info(f"Auth success from {ip}")
+            use_pty_requested = msg.get("use_pty", False)
+            pty_enabled = False
+            if use_pty_requested:
+                try:
+                    import winpty
+                    pty_enabled = True
+                except ImportError:
+                    pass
+
             _send(conn, {"type": "auth_result", "success": True,
-                         "message": "Authenticated. Welcome."})
+                         "message": "Authenticated. Welcome.",
+                         "pty_enabled": pty_enabled})
 
             # --- Simple streaming shell ------------
             conn.settimeout(None)  # No timeout for interactive shell
-            _run_shell(conn, ip, logger)
+            _run_shell(conn, ip, logger, use_pty=pty_enabled)
 
         else:
             # --- Auth failure – apply brute-force rules ---------------
@@ -370,6 +491,8 @@ def _handle_client(conn: ssl.SSLSocket, addr: tuple,
 
     except socket.timeout:
         logger.info(f"Connection from {ip} timed out.")
+    except ConnectionResetError:
+        logger.info(f"Connection from {ip} was reset by peer.")
     except Exception as exc:
         logger.error(f"Error handling {ip}: {exc}")
     finally:
@@ -636,6 +759,7 @@ def _relay_loop(cfg: dict, logger: logging.Logger, sec: SecurityManager) -> None
                 try:
                     ssl_conn = ssl_ctx.wrap_socket(sock, server_side=True)
                     logger.info("[RELAY] TLS OK. Waiting for admin to authenticate.")
+                    ssl_conn.settimeout(30) # Ensure auth handshake doesn't block forever
                     _handle_client(ssl_conn, (r_host, r_port), cfg, sec, logger)
                 except Exception as e:
                     logger.warning(f"[RELAY] Handler error: {e}")

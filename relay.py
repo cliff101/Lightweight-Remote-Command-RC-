@@ -64,8 +64,16 @@ def _fwd(src: socket.socket, dst: socket.socket) -> None:
             if not data:
                 break
             dst.sendall(data)
+    except ConnectionResetError:
+        pass
     except Exception:
         pass
+    finally:
+        # Force a shutdown on the other socket to unblock its recv() call
+        try:
+            dst.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
 
 
 def _readline(conn: socket.socket, max_bytes: int = 256) -> str:
@@ -131,8 +139,16 @@ def _handle(conn: socket.socket, addr: tuple) -> None:
         if is_master:
             conn.settimeout(None)
             # Notify both sides that the bridge is ready
-            matched_conn.sendall(b"PAIRED\n")
-            conn.sendall(b"PAIRED\n")
+            try:
+                matched_conn.sendall(b"PAIRED\n")
+                conn.sendall(b"PAIRED\n")
+            except Exception as exc:
+                print(f"[relay] Handshake failed: {exc}")
+                try: matched_conn.close()
+                except: pass
+                try: conn.close()
+                except: pass
+                return
 
             peer_ip = matched_conn.getpeername()[0]
             print(f"[relay] BRIDGING  {addr[0]} ({role}) <--> {peer_ip} ({opp_role})  "

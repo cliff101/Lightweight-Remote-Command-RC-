@@ -19,19 +19,20 @@ if %errorlevel% neq 0 (
 cd /d "%~dp0"
 
 echo Stopping service ...
+sc stop RemoteCommandServer >nul 2>&1
 python server.py stop >nul 2>&1
 timeout /t 3 /nobreak >nul
 
 echo Removing service ...
-python server.py remove
-if %errorlevel% neq 0 (
-    echo [WARNING] Could not remove service via Python.  Trying sc.exe ...
-    sc delete RemoteCommandServer >nul 2>&1
-)
+python server.py remove >nul 2>&1
+sc delete RemoteCommandServer >nul 2>&1
 timeout /t 2 /nobreak >nul
 
 echo Killing residual service host (pythonservice.exe) ...
 taskkill /F /IM pythonservice.exe >nul 2>&1
+
+echo Killing standalone server instances ...
+wmic process where "commandline like '%%server.py run%%'" call terminate >nul 2>&1
 
 echo Killing watermark indicator ...
 wmic process where "commandline like '%%watermark.py%%'" delete >nul 2>&1

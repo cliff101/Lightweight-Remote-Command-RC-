@@ -299,12 +299,12 @@ def _connect_relay(relay_addr: str, token: str,
 # Protocol operations
 # ---------------------------------------------------------------------------
 
-def _authenticate(conn, password: str):
-    _send(conn, {"type": "auth", "password": password})
+def _authenticate(conn, password: str, use_pty: bool = False):
+    _send(conn, {"type": "auth", "password": password, "use_pty": use_pty})
     resp = _recv(conn)
     if resp is None:
-        return False, "No response from server."
-    return resp.get("success", False), resp.get("message", "Unknown error.")
+        return False, "No response from server.", False
+    return resp.get("success", False), resp.get("message", "Unknown error."), resp.get("pty_enabled", False)
 
 
 def _stdin_ready() -> bool:
@@ -358,7 +358,9 @@ def _quit(conn) -> None:
 # Interactive shell
 # ---------------------------------------------------------------------------
 
-def _interactive(conn, host: str) -> None:
+def _interactive(conn, host: str, use_pty: bool = False) -> None:
+    import os
+    os.system("cls" if os.name == "nt" else "clear")
     print(f"\nConnected to {host}.\n")
 
     stop_event = threading.Event()
@@ -385,24 +387,135 @@ def _interactive(conn, host: str) -> None:
     recv_thread = threading.Thread(target=receive_output, daemon=True)
     recv_thread.start()
 
-    # Trigger the first prompt
-    _send(conn, {"type": "input", "data": "\n"})
+    # Trigger the first prompt (or initialize)
+    if not use_pty:
+        _send(conn, {"type": "input", "data": "\n"})
 
-    try:
-        while not stop_event.is_set():
-            if _stdin_ready():
-                try:
-                    line = sys.stdin.readline()
-                    if not line:
+    if use_pty:
+        is_windows = False
+        try:
+            import msvcrt
+            is_windows = True
+        except ImportError:
+            pass
+
+        if is_windows:
+            try:
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                handle = kernel32.GetStdHandle(-11) # STD_OUTPUT_HANDLE
+                mode = ctypes.c_uint32()
+                kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+                mode.value |= 0x0004 # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                kernel32.SetConsoleMode(handle, mode)
+            except Exception:
+                pass
+
+        old_settings = None
+        if not is_windows:
+            try:
+                import termios, tty
+                fd = sys.stdin.fileno()
+                old_settings = termios.tcgetattr(fd)
+                tty.setraw(fd)
+            except Exception:
+                pass
+
+        import queue
+        input_queue = queue.Queue()
+
+        def read_input():
+            if is_windows:
+                while not stop_event.is_set():
+                    try:
+                        char = msvcrt.getwch()
+                        if char in ('\x00', '\xe0'):
+                            if msvcrt.kbhit():
+                                char += msvcrt.getwch()
+                        
+                        # Map Windows special keys to VT escape sequences
+                        vt_map = {
+                            '\xe0H': '\x1b[A', # Up
+                            '\xe0P': '\x1b[B', # Down
+                            '\xe0M': '\x1b[C', # Right
+                            '\xe0K': '\x1b[D', # Left
+                            '\xe0S': '\x1b[3~', # Delete
+                        }
+                        if char in vt_map:
+                            char = vt_map[char]
+                        elif char == '\x1b':
+                            # Check for and discard terminal auto-responses like DA/CPR 
+                            # (e.g. \x1b[?61;6...c) which ConPTY queries can trigger.
+                            time.sleep(0.02)  # Give full VT sequence time to buffer
+                            if msvcrt.kbhit():
+                                next_char = msvcrt.getwch()
+                                if next_char == '[':
+                                    seq = '\x1b['
+                                    while msvcrt.kbhit():
+                                        c = msvcrt.getwch()
+                                        seq += c
+                                        # c or R terminates DA / CPR responses.
+                                        # other alphabets or ~ terminate other VT seqs.
+                                        if c.isalpha() or c == '~':
+                                            break
+                                    if seq[-1] in ('c', 'R'):
+                                        continue  # discard the terminal response entirely
+                                    else:
+                                        for c in seq:
+                                            input_queue.put(c)
+                                        continue
+                                else:
+                                    input_queue.put(char)
+                                    input_queue.put(next_char)
+                                    continue
+                            
+                        input_queue.put(char)
+                    except Exception:
+                        break
+            else:
+                while not stop_event.is_set():
+                    try:
+                        char = sys.stdin.read(1)
+                        if not char:
+                            break
+                        input_queue.put(char)
+                    except Exception:
                         break
 
+        threading.Thread(target=read_input, daemon=True).start()
+
+        try:
+            while not stop_event.is_set():
+                try:
+                    line = input_queue.get(timeout=0.05)
                     _send(conn, {"type": "input", "data": line})
+                except queue.Empty:
+                    pass
+        except KeyboardInterrupt:
+            pass
+        finally:
+            if not is_windows and old_settings:
+                import termios
+                try:
+                    termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
                 except Exception:
-                    break
-            else:
-                time.sleep(0.05)
-    except KeyboardInterrupt:
-        pass
+                    pass
+    else:
+        try:
+            while not stop_event.is_set():
+                if _stdin_ready():
+                    try:
+                        line = sys.stdin.readline()
+                        if not line:
+                            break
+
+                        _send(conn, {"type": "input", "data": line})
+                    except Exception:
+                        break
+                else:
+                    time.sleep(0.05)
+        except KeyboardInterrupt:
+            pass
 
     _quit(conn)
 
@@ -467,7 +580,7 @@ def _listen_mode(args) -> None:
                         ssl_conn.close()
                         break
 
-                ok, message = _authenticate(ssl_conn, password)
+                ok, message, pty_enabled = _authenticate(ssl_conn, password, args.pty)
                 if not ok:
                     print(f"[AUTH FAILED] {message}")
                     ssl_conn.close()
@@ -475,8 +588,10 @@ def _listen_mode(args) -> None:
                     continue
 
                 print(f"[AUTH OK] {message}")
+                if args.pty and not pty_enabled:
+                    print("[INFO] Server does not support ConPTY (winpty not installed). Falling back to standard shell.")
                 ssl_conn.settimeout(None)
-                _interactive(ssl_conn, addr[0])
+                _interactive(ssl_conn, addr[0], pty_enabled)
                 ssl_conn.close()
                 print("\n[LISTEN] Session ended. Waiting for next connection …")
 
@@ -533,6 +648,9 @@ def main() -> None:
                     help="Proxy credentials  USER:PASS  (Basic auth)")
     ap.add_argument("-c", "--command", default=None,
                     help="Run a single command and exit (non-interactive)")
+
+    ap.add_argument("--pty",         action="store_true",
+                    help="Enable experimental ConPTY mode for Tab completion and interactive features")
 
     # Reverse mode
     ap.add_argument("--listen",      action="store_true",
@@ -614,7 +732,7 @@ def main() -> None:
     conn.settimeout(30)
 
     # ── Authenticate ──────────────────────────────────────────────────────
-    ok, message = _authenticate(conn, password)
+    ok, message, pty_enabled = _authenticate(conn, password, args.pty)
     if not ok:
         print(f"[AUTH FAILED] {message}")
         try:
@@ -624,6 +742,8 @@ def main() -> None:
         sys.exit(1)
 
     print(f"[AUTH OK] {message}")
+    if args.pty and not pty_enabled:
+        print("[INFO] Server does not support ConPTY (winpty not installed). Falling back to standard shell.")
     conn.settimeout(None)
 
     # ── Run ───────────────────────────────────────────────────────────────
@@ -637,7 +757,7 @@ def main() -> None:
             pass
         sys.exit(rc)
     else:
-        _interactive(conn, display_host)
+        _interactive(conn, display_host, pty_enabled)
         try:
             conn.close()
         except Exception:

@@ -12,6 +12,7 @@ A lightweight, secure, encrypted remote command server and client written in Pyt
   - **Reverse**: Server connects out to the client (bypasses server inbound firewalls)
   - **Relay**: Both server and client connect to a public relay (bypasses firewalls on both sides)
 - **Windows Service**: Server can install and run as a background Windows Service with SYSTEM privileges.
+- **Experimental ConPTY Mode**: Supports full remote tab-completion and arrow-key command history on Windows by emulating a true interactive terminal.
 
 ## Quick Start (Direct Mode)
 
@@ -47,6 +48,10 @@ To cleanly uninstall everything later, run `uninstall.bat` as Administrator.
 4. Connect the client (from any machine):
    ```cmd
    python client.py --host 127.0.0.1 --cert server.crt
+   ```
+   *(Optional)* Add `--pty` to enable experimental ConPTY mode for Tab completion:
+   ```cmd
+   python client.py --host 127.0.0.1 --cert server.crt --pty
    ```
 5. Test the connection:
    ```cmd
@@ -146,6 +151,7 @@ Edit `config.json` on the server machine:
 ```cmd
 python client.py --relay PASTE-GCP-IP-HERE:443 --relay-token session01 --cert server.crt
 ```
+*(Optional)* Enable Tab completion and interactive features by appending `--pty`.
 
 ## Security Note
 Keep your `server.key`, `config.json` (contains password hashes), and `blacklist.json` secure. The `server.crt` is safe to distribute to clients.
