@@ -176,6 +176,51 @@ _SYS_ENC = locale.getpreferredencoding(False) or "cp850"
 def _run_shell(conn: ssl.SSLSocket, ip: str, logger: logging.Logger):
     """Spawns a cmd.exe process and blindly streams IO back and forth."""
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    
+    # Pass the current environment variables so PATH is preserved
+    env = os.environ.copy()
+    
+    # Try to load the System PATH and all user PATHs if running as a service
+    try:
+        import winreg
+        paths_to_add = []
+        
+        # System Path
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"System\CurrentControlSet\Control\Session Manager\Environment") as key:
+                paths_to_add.append(winreg.QueryValueEx(key, "Path")[0])
+        except Exception:
+            pass
+            
+        # All Users Path
+        try:
+            with winreg.OpenKey(winreg.HKEY_USERS, "") as users_key:
+                for i in range(winreg.QueryInfoKey(users_key)[0]):
+                    sid = winreg.EnumKey(users_key, i)
+                    if not sid.endswith("_Classes"):
+                        try:
+                            with winreg.OpenKey(winreg.HKEY_USERS, rf"{sid}\Environment") as env_key:
+                                paths_to_add.append(winreg.QueryValueEx(env_key, "Path")[0])
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+            
+        combined_path = ";".join(paths_to_add)
+        
+        path_key = "PATH"
+        for k in env.keys():
+            if k.upper() == "PATH":
+                path_key = k
+                break
+                
+        if path_key in env:
+            env[path_key] = f"{env[path_key]};{combined_path}"
+        else:
+            env["PATH"] = combined_path
+    except Exception:
+        pass
+    
     proc = subprocess.Popen(
         "cmd.exe",
         stdin=subprocess.PIPE,
@@ -184,6 +229,7 @@ def _run_shell(conn: ssl.SSLSocket, ip: str, logger: logging.Logger):
         cwd="C:\\",
         shell=False,
         creationflags=flags,
+        env=env
     )
 
     def output_relay():
@@ -583,11 +629,29 @@ def _relay_loop(cfg: dict, logger: logging.Logger, sec: SecurityManager) -> None
                 _stop_flag.wait(timeout=interval)
                 continue
 
-            logger.info("[RELAY] Paired! Starting TLS handshake …")
+            logger.info("[RELAY] Paired! Handing off to client thread …")
             raw.settimeout(None)
-            ssl_conn = ssl_ctx.wrap_socket(raw, server_side=True)
-            logger.info("[RELAY] TLS OK. Waiting for admin to authenticate.")
-            _handle_client(ssl_conn, (relay_host, relay_port), cfg, sec, logger)
+            
+            def _relay_client_handler(sock, r_host, r_port):
+                try:
+                    ssl_conn = ssl_ctx.wrap_socket(sock, server_side=True)
+                    logger.info("[RELAY] TLS OK. Waiting for admin to authenticate.")
+                    _handle_client(ssl_conn, (r_host, r_port), cfg, sec, logger)
+                except Exception as e:
+                    logger.warning(f"[RELAY] Handler error: {e}")
+                finally:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+            
+            t = threading.Thread(
+                target=_relay_client_handler,
+                args=(raw, relay_host, relay_port),
+                daemon=True
+            )
+            t.start()
+            raw = None  # Clear so the finally block doesn't close it, allowing the loop to immediately wait for the next client.
 
         except ssl.SSLError as exc:
             logger.warning(f"[RELAY] TLS error: {exc}")

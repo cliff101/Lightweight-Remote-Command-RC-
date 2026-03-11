@@ -48,7 +48,7 @@ class _Waiter:
         self.ev   = threading.Event()   # set when partner arrives
 
 
-_pending: dict = {}    # "ROLE:token" -> _Waiter
+_pending: dict = {}    # "ROLE:token" -> list[_Waiter]
 _plock          = threading.Lock()
 
 
@@ -113,15 +113,19 @@ def _handle(conn: socket.socket, addr: tuple) -> None:
 
         waiter = _Waiter(conn)
         with _plock:
-            if opp_key in _pending:
-                opp_w = _pending.pop(opp_key)
+            if opp_key in _pending and _pending[opp_key]:
+                opp_w = _pending[opp_key].pop(0)
+                if not _pending[opp_key]:
+                    del _pending[opp_key]
                 # Tell the waiting thread it has a partner
                 opp_w.conn.settimeout(None)
                 matched_conn  = opp_w.conn
                 is_master     = True
                 opp_w.ev.set()        # wake waiter thread so it can exit cleanly
             else:
-                _pending[my_key] = waiter
+                if my_key not in _pending:
+                    _pending[my_key] = []
+                _pending[my_key].append(waiter)
 
         # ── Branch: we are the bridge master (second to arrive) ────────────
         if is_master:
@@ -157,7 +161,10 @@ def _handle(conn: socket.socket, addr: tuple) -> None:
             if not paired:
                 print(f"[relay] {ip}: timeout, no partner arrived for token={token[:16]!r}")
                 with _plock:
-                    _pending.pop(my_key, None)
+                    if my_key in _pending and waiter in _pending[my_key]:
+                        _pending[my_key].remove(waiter)
+                        if not _pending[my_key]:
+                            del _pending[my_key]
                 conn.close()
             # If paired: bridge master owns both sockets now. This thread just exits.
 

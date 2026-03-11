@@ -55,7 +55,7 @@ To cleanly uninstall everything later, run `uninstall.bat` as Administrator.
 
 ## Setting up Relay Mode on Google Cloud Platform (GCP)
 
-Relay mode is useful when both the server and the client are behind strict firewalls and cannot accept incoming connections. 
+Relay mode is useful when both the server and the client are behind strict firewalls and cannot accept incoming connections. The relay server is fully multi-client capable, meaning **unlimited simultaneous clients** can connect to the same target server at once!
 
 💡 **Tip:** You can host the relay server completely for free using [Google Cloud's Free Tier](https://cloud.google.com/free), which provides an `e2-micro` VM instance perpetually for free.
 
