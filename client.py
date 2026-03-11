@@ -359,7 +359,7 @@ def _quit(conn) -> None:
 # ---------------------------------------------------------------------------
 
 def _interactive(conn, host: str) -> None:
-    print(f"\nConnected to {host}. Type 'exit' or 'quit' to disconnect.\n")
+    print(f"\nConnected to {host}.\n")
 
     stop_event = threading.Event()
 
