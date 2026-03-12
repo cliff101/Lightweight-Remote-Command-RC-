@@ -274,7 +274,7 @@ def _run_shell(conn: ssl.SSLSocket, ip: str, logger: logging.Logger, use_pty: bo
         except Exception as e:
             logger.warning(f"ConPTY failed to start: {e}. Falling back to standard pipes.")
 
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     
     # Pass the current environment variables so PATH is preserved
     env = os.environ.copy()
@@ -374,11 +374,23 @@ def _run_shell(conn: ssl.SSLSocket, ip: str, logger: logging.Logger, use_pty: bo
                 # Normalize line endings to \r\n for Windows apps
                 if data:
                     data = data.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+                    
+                    # Force Python interactive mode so it doesn't block waiting for EOF in non-PTY mode
+                    cmd_stripped = data.strip()
+                    if cmd_stripped in ("python", "python.exe", "python3", "python3.exe"):
+                        data = data.replace(cmd_stripped, cmd_stripped + " -i")
+                        
                     try:
                         proc.stdin.write(data.encode(_SYS_ENC, errors="replace"))
                         proc.stdin.flush()
                     except Exception:
                         break
+            elif mtype == "signal" and msg.get("signal") == "SIGINT":
+                try:
+                    import signal
+                    os.kill(proc.pid, signal.CTRL_BREAK_EVENT)
+                except Exception as e:
+                    logger.warning(f"Failed to send SIGINT to proc {proc.pid}: {e}")
             else:
                 try:
                     _send(conn, {"type": "error", "message": f"Unknown message type: {mtype!r}"})

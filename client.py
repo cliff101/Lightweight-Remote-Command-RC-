@@ -458,8 +458,17 @@ def _interactive(conn, host: str, use_pty: bool = False) -> None:
                                         # other alphabets or ~ terminate other VT seqs.
                                         if c.isalpha() or c == '~':
                                             break
-                                    if seq[-1] in ('c', 'R'):
-                                        continue  # discard the terminal response entirely
+                                    if seq[-1] == 'R':
+                                        # winpty-agent needs the CPR (Cursor Position Report) response, 
+                                        # or it will continuously redraw (causing screen flashing).
+                                        for c in seq:
+                                            input_queue.put(c)
+                                        continue
+                                    elif seq[-1] == 'c':
+                                        # Discard DA (Device Attributes) responses. winpty's older VT parser 
+                                        # doesn't understand the long modern DA response and will echo it as 
+                                        # literal keystrokes like `[?61;...c`.
+                                        continue
                                     else:
                                         for c in seq:
                                             input_queue.put(c)
@@ -487,12 +496,23 @@ def _interactive(conn, host: str, use_pty: bool = False) -> None:
         try:
             while not stop_event.is_set():
                 try:
-                    line = input_queue.get(timeout=0.05)
-                    _send(conn, {"type": "input", "data": line})
-                except queue.Empty:
-                    pass
-        except KeyboardInterrupt:
-            pass
+                    try:
+                        line = input_queue.get(timeout=0.05)
+                        # Drain the rest of the queue to send in one packet
+                        while not input_queue.empty():
+                            try:
+                                line += input_queue.get_nowait()
+                            except queue.Empty:
+                                break
+                        _send(conn, {"type": "input", "data": line})
+                    except queue.Empty:
+                        pass
+                except KeyboardInterrupt:
+                    # Main thread caught Ctrl+C, send it to the PTY
+                    try:
+                        _send(conn, {"type": "input", "data": "\x03"})
+                    except Exception:
+                        pass
         finally:
             if not is_windows and old_settings:
                 import termios
@@ -501,8 +521,8 @@ def _interactive(conn, host: str, use_pty: bool = False) -> None:
                 except Exception:
                     pass
     else:
-        try:
-            while not stop_event.is_set():
+        while not stop_event.is_set():
+            try:
                 if _stdin_ready():
                     try:
                         line = sys.stdin.readline()
@@ -514,8 +534,12 @@ def _interactive(conn, host: str, use_pty: bool = False) -> None:
                         break
                 else:
                     time.sleep(0.05)
-        except KeyboardInterrupt:
-            pass
+            except KeyboardInterrupt:
+                try:
+                    _send(conn, {"type": "signal", "signal": "SIGINT"})
+                except Exception:
+                    pass
+                time.sleep(0.1)
 
     _quit(conn)
 
