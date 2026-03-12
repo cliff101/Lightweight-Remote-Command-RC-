@@ -94,10 +94,10 @@ class SecurityManager:
             return "failed"
 
     def record_success(self, ip: str):
-        """Reset per-round failure counter on successful authentication.
-        Block-cycle count is intentionally preserved."""
+        """Reset per-round failure counter and block-cycle count on successful authentication."""
         with self._lock:
             self._failures.pop(ip, None)
+            self._block_count.pop(ip, None)
 
     def get_failures(self, ip: str) -> int:
         """Current round failure count (0-4)."""
