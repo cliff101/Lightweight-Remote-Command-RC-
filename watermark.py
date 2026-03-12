@@ -177,6 +177,8 @@ class Watermark:
         self.menu.add_command(label="■  Stop Service",    command=self._stop)
         self.menu.add_command(label="↺  Restart Service", command=self._restart)
         self.menu.add_separator()
+        self.menu.add_command(label="⏻  Shutdown All",    command=self._shutdown_all)
+        self.menu.add_separator()
         self.menu.add_command(label="📄  View Logs",       command=self._logs)
         self.menu.add_separator()
         self.menu.add_command(label="✕  Close Indicator", command=self.root.destroy)
@@ -203,7 +205,7 @@ class Watermark:
     def _poll(self):
         status = _get_status()
 
-        if status in ("stopped", "not_installed"):
+        if status == "not_installed":
             self.root.destroy()
             return
 
@@ -250,6 +252,10 @@ class Watermark:
         import time; time.sleep(1)
         if not _sc("start"):
             mb.showwarning("RC Server", "Could not restart service.\nTry running as Administrator.")
+
+    def _shutdown_all(self):
+        self._stop()
+        self.root.destroy()
 
     def _logs(self, _event=None):
         if os.path.exists(LOG_FILE):
