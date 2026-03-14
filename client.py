@@ -364,6 +364,7 @@ def _interactive(conn, host: str, use_pty: bool = False) -> None:
     print(f"\nConnected to {host}.\n")
 
     stop_event = threading.Event()
+    current_line = [""]
 
     def receive_output():
         try:
@@ -377,6 +378,15 @@ def _interactive(conn, host: str, use_pty: bool = False) -> None:
                 if mtype == "output_chunk":
                     sys.stdout.write(msg.get("data", ""))
                     sys.stdout.flush()
+                elif mtype == "tab_completed":
+                    new_line = msg.get("data", "")
+                    # clear current line
+                    if not use_pty:
+                        # backspace the whole length
+                        bs = '\b \b' * len(current_line[0])
+                        sys.stdout.write(bs + new_line)
+                        sys.stdout.flush()
+                        current_line[0] = new_line
                 elif mtype in ("command_done", "bye"):
                     break
                 elif mtype == "error":
@@ -521,25 +531,90 @@ def _interactive(conn, host: str, use_pty: bool = False) -> None:
                 except Exception:
                     pass
     else:
-        while not stop_event.is_set():
+        import queue
+        input_queue = queue.Queue()
+        
+        is_windows = False
+        try:
+            import msvcrt
+            is_windows = True
+        except ImportError:
+            pass
+            
+        old_settings = None
+        if not is_windows:
             try:
-                if _stdin_ready():
+                import termios, tty
+                fd = sys.stdin.fileno()
+                old_settings = termios.tcgetattr(fd)
+                tty.setcbreak(fd) # cbreak so Ctrl+C still raises KeyboardInterrupt
+            except Exception:
+                pass
+            
+        def read_input_non_pty():
+            if is_windows:
+                while not stop_event.is_set():
                     try:
-                        line = sys.stdin.readline()
-                        if not line:
-                            break
-
-                        _send(conn, {"type": "input", "data": line})
+                        if msvcrt.kbhit():
+                            char = msvcrt.getwch()
+                            if char in ('\x00', '\xe0'):
+                                char += msvcrt.getwch()
+                            input_queue.put(char)
+                        else:
+                            time.sleep(0.01)
                     except Exception:
                         break
-                else:
-                    time.sleep(0.05)
+            else:
+                while not stop_event.is_set():
+                    try:
+                        char = sys.stdin.read(1)
+                        if not char:
+                            break
+                        input_queue.put(char)
+                    except Exception:
+                        break
+
+        threading.Thread(target=read_input_non_pty, daemon=True).start()
+
+        while not stop_event.is_set():
+            try:
+                try:
+                    char = input_queue.get(timeout=0.05)
+                    
+                    if char == '\r' or char == '\n':
+                        sys.stdout.write('\n')
+                        sys.stdout.flush()
+                        _send(conn, {"type": "input", "data": current_line[0] + "\n"})
+                        current_line[0] = ""
+                    elif char == '\t':
+                        # Send to server for simulation
+                        _send(conn, {"type": "simulate_tab", "data": current_line[0]})
+                    elif char == '\x03': # Ctrl+C
+                        raise KeyboardInterrupt
+                    elif char == '\x08' or char == '\x7f': # Backspace
+                        if len(current_line[0]) > 0:
+                            current_line[0] = current_line[0][:-1]
+                            sys.stdout.write('\b \b')
+                            sys.stdout.flush()
+                    elif not char.startswith('\xe0') and not char.startswith('\x00'):
+                        current_line[0] += char
+                        sys.stdout.write(char)
+                        sys.stdout.flush()
+                except queue.Empty:
+                    pass
             except KeyboardInterrupt:
                 try:
                     _send(conn, {"type": "signal", "signal": "SIGINT"})
                 except Exception:
                     pass
                 time.sleep(0.1)
+
+        if not is_windows and old_settings:
+            import termios
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
+            except Exception:
+                pass
 
     _quit(conn)
 

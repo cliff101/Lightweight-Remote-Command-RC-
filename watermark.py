@@ -26,7 +26,9 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
+import queue
 import tkinter as tk
 import tkinter.messagebox as mb
 
@@ -82,12 +84,14 @@ def _get_status() -> str:
         return "unknown"
 
 
-def _sc(action: str) -> bool:
-    r = subprocess.run(
-        ["sc", action, SERVICE_NAME],
-        capture_output=True, shell=True,
-    )
-    return r.returncode == 0
+def _run_admin_cmd(cmd_str: str) -> bool:
+    r = subprocess.run(cmd_str, capture_output=True, shell=True)
+    if r.returncode == 0:
+        return True
+    # Try elevated, pause on error so user can see why it failed
+    elevated_cmd = f"/c {cmd_str} || pause"
+    ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", elevated_cmd, None, 0)
+    return ret > 32
 
 
 def _read_stats() -> dict:
@@ -189,10 +193,27 @@ class Watermark:
         self.cv.bind("<Button-3>",        self._show_menu)
         self.cv.bind("<Double-Button-1>", self._logs)
 
+        self.cmd_queue = queue.Queue()
+        threading.Thread(target=self._cmd_worker, daemon=True).start()
+
         self._place_default()
         self._poll()
         self.root.mainloop()
 
+    # ── Command queue worker ─────────────────────────────────────────
+
+    def _cmd_worker(self):
+        while True:
+            cmd = self.cmd_queue.get()
+            if cmd is None:
+                break
+            
+            if cmd == "start":
+                if not _run_admin_cmd(f"net start {SERVICE_NAME}"):
+                    self.root.after(0, lambda: mb.showwarning("RC Server", "Could not start service.\nTry running as Administrator."))
+            elif cmd == "stop":
+                if not _run_admin_cmd(f"net stop {SERVICE_NAME}"):
+                    self.root.after(0, lambda: mb.showwarning("RC Server", "Could not stop service.\nTry running as Administrator."))
     # ── Positioning ──────────────────────────────────────────────────
 
     def _place_default(self):
@@ -240,18 +261,14 @@ class Watermark:
         self.menu.tk_popup(event.x_root, event.y_root)
 
     def _start(self):
-        if not _sc("start"):
-            mb.showwarning("RC Server", "Could not start service.\nTry running as Administrator.")
+        self.cmd_queue.put("start")
 
     def _stop(self):
-        if not _sc("stop"):
-            mb.showwarning("RC Server", "Could not stop service.\nTry running as Administrator.")
+        self.cmd_queue.put("stop")
 
     def _restart(self):
-        _sc("stop")
-        import time; time.sleep(1)
-        if not _sc("start"):
-            mb.showwarning("RC Server", "Could not restart service.\nTry running as Administrator.")
+        self.cmd_queue.put("stop")
+        self.cmd_queue.put("start")
 
     def _shutdown_all(self):
         self._stop()

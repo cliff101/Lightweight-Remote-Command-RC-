@@ -63,6 +63,33 @@ except Exception:
 # Set by SvcStop or KeyboardInterrupt – all loops check this to know when to quit.
 _stop_flag = threading.Event()
 
+# Track all active network sockets to close them forcefully when stopping the service.
+_active_sockets = set()
+_active_sockets_lock = threading.Lock()
+
+def _register_socket(sock) -> None:
+    if sock is not None:
+        with _active_sockets_lock:
+            _active_sockets.add(sock)
+
+def _unregister_socket(sock) -> None:
+    if sock is not None:
+        with _active_sockets_lock:
+            _active_sockets.discard(sock)
+
+def _close_all_sockets() -> None:
+    with _active_sockets_lock:
+        for sock in list(_active_sockets):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+        _active_sockets.clear()
+
 # ---------------------------------------------------------------------------
 # Ensure the directory that contains this script is on sys.path so that the
 # security module can always be found, even when launched by SCM.
@@ -331,14 +358,26 @@ def _run_shell(conn: ssl.SSLSocket, ip: str, logger: logging.Logger, use_pty: bo
         env=env
     )
 
+    current_cwd = ["C:\\"]
+    tab_state = {"last_completed_cmd": None, "matches": [], "index": 0, "prefix_len": 0}
+
     def output_relay():
+        import re
+        prompt_re = re.compile(r'(?:^|\n)([a-zA-Z]:\\[^>]*?)>')
         try:
             while True:
                 # read1 is crucial here to flush partial lines like prompts
                 chunk = proc.stdout.read1(4096)
                 if not chunk:
                     break
-                _send(conn, {"type": "output_chunk", "data": chunk.decode(_SYS_ENC, errors="replace")})
+                decoded = chunk.decode(_SYS_ENC, errors="replace")
+                
+                # extract last prompt to maintain CWD
+                matches = prompt_re.findall(decoded)
+                if matches:
+                    current_cwd[0] = matches[-1]
+                
+                _send(conn, {"type": "output_chunk", "data": decoded})
         except Exception:
             pass
         finally:
@@ -391,6 +430,83 @@ def _run_shell(conn: ssl.SSLSocket, ip: str, logger: logging.Logger, use_pty: bo
                     os.kill(proc.pid, signal.CTRL_BREAK_EVENT)
                 except Exception as e:
                     logger.warning(f"Failed to send SIGINT to proc {proc.pid}: {e}")
+            elif mtype == "simulate_tab":
+                cmd_line = msg.get("data", "")
+                if not cmd_line:
+                    continue
+                
+                try:
+                    import glob
+                    import shlex
+                    
+                    if tab_state["last_completed_cmd"] == cmd_line and tab_state["matches"]:
+                        # we are cycling
+                        tab_state["index"] = (tab_state["index"] + 1) % len(tab_state["matches"])
+                        match = tab_state["matches"][tab_state["index"]]
+                        prefix_len = tab_state["prefix_len"]
+                    else:
+                        # new search
+                        if cmd_line.endswith(" "):
+                            last_part = ""
+                            search_part = ""
+                        else:
+                            try:
+                                parts = shlex.split(cmd_line, posix=False)
+                            except ValueError:
+                                parts = cmd_line.split(" ")
+                            
+                            if not parts:
+                                continue
+                            last_part = parts[-1]
+                            search_part = last_part.strip('"\'')
+                        
+                        if search_part:
+                            if not os.path.isabs(search_part):
+                                search_path = os.path.join(current_cwd[0], search_part)
+                            else:
+                                search_path = search_part
+                        else:
+                            search_path = os.path.join(current_cwd[0], "")
+                            
+                        matches = glob.glob(search_path + "*")
+                        if not matches:
+                            continue
+                            
+                        # sort matches by name length or alphabetically
+                        matches.sort(key=str.lower)
+                        
+                        tab_state["matches"] = []
+                        tab_state["index"] = 0
+                        
+                        for m in matches:
+                            is_dir = os.path.isdir(m)
+                            base_name = os.path.basename(m.rstrip("\\/"))
+                            
+                            if search_part and os.path.dirname(search_part):
+                                replacement = os.path.join(os.path.dirname(search_part), base_name)
+                            else:
+                                replacement = base_name
+                                
+                            if is_dir and not replacement.endswith("\\"):
+                                replacement += "\\"
+                                    
+                            if " " in replacement and not last_part.startswith('"'):
+                                replacement = f'"{replacement}"'
+                            elif last_part.startswith('"') and not replacement.endswith('"'):
+                                replacement = f'"{replacement}"'
+                                
+                            tab_state["matches"].append(replacement)
+                            
+                        prefix_len = len(cmd_line) - len(last_part)
+                        tab_state["prefix_len"] = prefix_len
+                        match = tab_state["matches"][0]
+
+                    completed_cmd = cmd_line[:prefix_len] + match
+                    tab_state["last_completed_cmd"] = completed_cmd
+                    
+                    _send(conn, {"type": "tab_completed", "data": completed_cmd})
+                except Exception as e:
+                    logger.warning(f"Simulate tab failed: {e}")
             else:
                 try:
                     _send(conn, {"type": "error", "message": f"Unknown message type: {mtype!r}"})
@@ -417,6 +533,7 @@ def _run_shell(conn: ssl.SSLSocket, ip: str, logger: logging.Logger, use_pty: bo
 def _handle_client(conn: ssl.SSLSocket, addr: tuple,
                    config: dict, security: SecurityManager,
                    logger: logging.Logger) -> None:
+    _register_socket(conn)
     ip = addr[0]
     authenticated = False
     logger.info(f"Connection from {ip}:{addr[1]}")
@@ -508,6 +625,7 @@ def _handle_client(conn: ssl.SSLSocket, addr: tuple,
     except Exception as exc:
         logger.error(f"Error handling {ip}: {exc}")
     finally:
+        _unregister_socket(conn)
         if authenticated:
             with _stats_lock:
                 _stats["active_clients"] = max(0, _stats["active_clients"] - 1)
@@ -553,6 +671,7 @@ class Server:
         port = self.config["port"]
         try:
             self._sock.bind((host, port))
+            _register_socket(self._sock)
         except OSError as exc:
             # Provide an actionable message when the port is already in use.
             # Port 443 conflicts are common when IIS or HTTP.sys is running.
@@ -612,6 +731,11 @@ class Server:
     def stop(self) -> None:
         self.running = False
         if self._sock:
+            _unregister_socket(self._sock)
+            try:
+                self._sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
             try:
                 self._sock.close()
             except Exception:
@@ -634,9 +758,16 @@ def _load_components() -> tuple:
 # ---------------------------------------------------------------------------
 
 def _readline_raw(sock: socket.socket, max_bytes: int = 256) -> str:
+    import select
     buf = b""
     while len(buf) < max_bytes:
+        if _stop_flag.is_set():
+            return ""
         try:
+            # Wait up to 1 second for data to become available
+            r, _, _ = select.select([sock], [], [], 1.0)
+            if not r:
+                continue
             b = sock.recv(1)
         except Exception:
             return ""
@@ -683,10 +814,24 @@ def _reverse_loop(cfg: dict, logger: logging.Logger, sec: SecurityManager) -> No
         try:
             logger.info(f"[REVERSE] Dialling {host}:{port} …")
             raw = socket.create_connection((host, port), timeout=10)
+            _register_socket(raw)
             # We are the TCP client but the TLS *server* (we present our cert)
             ssl_conn = ssl_ctx.wrap_socket(raw, server_side=True)
+            _register_socket(ssl_conn)
             logger.info(f"[REVERSE] TLS handshake OK. Waiting for admin to authenticate.")
-            _handle_client(ssl_conn, (host, port), cfg, sec, logger)
+            
+            # Spawn a thread so we don't block the loop on the connection, allowing _stop_flag to be checked
+            t = threading.Thread(
+                target=_handle_client,
+                args=(ssl_conn, (host, port), cfg, sec, logger),
+                daemon=True
+            )
+            t.start()
+            
+            # Now wait for the thread to exit, or the stop flag to be set
+            while t.is_alive() and not _stop_flag.is_set():
+                t.join(1.0)
+                
         except ssl.SSLError as exc:
             logger.warning(f"[REVERSE] TLS error: {exc}")
         except (ConnectionRefusedError, socket.timeout, OSError) as exc:
@@ -695,6 +840,7 @@ def _reverse_loop(cfg: dict, logger: logging.Logger, sec: SecurityManager) -> No
             logger.warning(f"[REVERSE] Unexpected error: {exc}")
         finally:
             if raw:
+                _unregister_socket(raw)
                 try:
                     raw.close()
                 except Exception:
@@ -742,6 +888,7 @@ def _relay_loop(cfg: dict, logger: logging.Logger, sec: SecurityManager) -> None
         try:
             logger.info(f"[RELAY] Connecting to relay {relay_host}:{relay_port} …")
             raw = socket.create_connection((relay_host, relay_port), timeout=10)
+            _register_socket(raw)
             raw.settimeout(30)
 
             # Relay handshake
@@ -797,6 +944,7 @@ def _relay_loop(cfg: dict, logger: logging.Logger, sec: SecurityManager) -> None
             logger.warning(f"[RELAY] Unexpected error: {exc}")
         finally:
             if raw:
+                _unregister_socket(raw)
                 try:
                     raw.close()
                 except Exception:
@@ -818,14 +966,14 @@ def _heartbeat_loop() -> None:
         _stop_flag.wait(timeout=5)
 
 
-def _dispatch(cfg: dict, logger: logging.Logger, sec: SecurityManager) -> None:
+def _dispatch(cfg: dict, logger: logging.Logger, sec: SecurityManager, existing_server=None) -> None:
     _init_stats()
     threading.Thread(target=_heartbeat_loop, daemon=True, name="heartbeat").start()
     mode = cfg.get("mode", "listen").lower()
     logger.info(f"Starting in mode: {mode!r}")
 
     if mode == "listen":
-        server = Server(cfg, sec, logger)
+        server = existing_server if existing_server else Server(cfg, sec, logger)
         server.start()
 
     elif mode == "reverse":
@@ -862,6 +1010,7 @@ try:
             self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
             win32event.SetEvent(self.hWaitStop)
             _stop_flag.set()
+            _close_all_sockets()
             if self._server:
                 self._server.stop()
 
@@ -876,7 +1025,7 @@ try:
                 if cfg.get("mode", "listen") == "listen":
                     self._server = Server(cfg, sec, logger)
                 logger.info("Windows service starting.")
-                _dispatch(cfg, logger, sec)
+                _dispatch(cfg, logger, sec, existing_server=self._server)
             except Exception as exc:
                 servicemanager.LogErrorMsg(f"RemoteCommandServer fatal error: {exc}")
 
@@ -897,6 +1046,7 @@ def _run_standalone() -> None:
         _dispatch(cfg, logger, sec)
     except KeyboardInterrupt:
         _stop_flag.set()
+        _close_all_sockets()
         logger.info("Server stopped by user.")
 
 

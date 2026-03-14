@@ -174,3 +174,5 @@ server.crt
 server.key
 blacklist.json
 config.json
+
+cmd.txt
